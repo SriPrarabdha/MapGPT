@@ -7,14 +7,87 @@ import random
 from abc import ABC, abstractmethod
 
 class Agent(ABC):
-     def __init__(self, name: str):
+    """
+    Abstract base class for all agents in the multi-agent navigation system.
+    """
+
+    def __init__(self, name: str, llm_client: LLMClient):
+        """
+        Initialize the agent with a name and LLM client.
+
+        :param name: A string identifier for the agent
+        :param llm_client: An instance of LLMClient for interacting with the LLM
+        """
         self.name = name
+        self.llm_client = llm_client
+
+    @abstractmethod
+    async def process(self, input_data: Any) -> Dict[str, Any]:
+        """
+        Process the input data and return a result.
+
+        This method should be implemented by all subclasses.
+
+        :param input_data: The input data to be processed. The type can vary depending on the specific agent.
+        :return: A dictionary containing the processing results.
+        """
+        pass
+
+    async def initialize(self) -> None:
+        """
+        Initialize the agent's state or perform any necessary setup.
+
+        This method can be overridden by subclasses if needed.
+        """
+        await self.log("Initializing agent")
+
+    async def shutdown(self) -> None:
+        """
+        Perform any necessary cleanup or resource release.
+
+        This method can be overridden by subclasses if needed.
+        """
+        await self.log("Shutting down agent")
+
+    def __str__(self) -> str:
+        """
+        Return a string representation of the agent.
+
+        :return: A string describing the agent.
+        """
+        return f"{self.__class__.__name__}(name={self.name})"
+
+    @property
+    def agent_type(self) -> str:
+        """
+        Return the type of the agent.
+
+        :return: A string representing the agent's type.
+        """
+        return self.__class__.__name__
+
+    async def log(self, message: str) -> None:
+        """
+        Log a message from the agent.
+
+        This method can be used for debugging or monitoring agent activities.
+
+        :param message: The message to be logged.
+        """
+        print(f"[{self.name}] {message}")
+
+    async def generate_with_llm(self, prompt: str, **kwargs) -> str:
+        """
+        Generate a response using the LLM.
+
+        :param prompt: The prompt to send to the LLM
+        :param kwargs: Additional keyword arguments for the LLM client
+        :return: The generated response
+        """
+        return await self.llm_client.generate(prompt, **kwargs)
 
 
 class PerceptionAgent(Agent):
-    def __init__(self, llm_client: LLMClient):
-        self.llm_client = llm_client
-
     async def process(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         """
         Process the observation data, including images, and extract relevant information.
@@ -60,10 +133,9 @@ class PerceptionAgent(Agent):
         6. Potential navigation paths or obstacles
         """
 
-        response = await self.llm_client.process_image(image, prompt)
+        response = await self.generate_with_llm(prompt, image=image)
         
         # Parse the LLM response to extract structured information
-        # This is a simplified parsing; you might want to use more sophisticated NLP techniques
         parsed_info = {
             'scene_description': self._extract_info(response, 'Overall scene description:'),
             'key_objects': self._extract_list(response, 'Key objects:'),
@@ -89,81 +161,110 @@ class PerceptionAgent(Agent):
         return [item.strip() for item in info.split(',') if item.strip()]
 
 class MapAgent(Agent):
-    def __init__(self, batch_size):
-        self.nodes_list = [[] for _ in range(batch_size)]
-        self.node_imgs = [[] for _ in range(batch_size)]
-        self.graph = [{} for _ in range(batch_size)]
-        self.trajectory = [[] for _ in range(batch_size)]
+    def __init__(self, name: str, llm_client: LLMClient):
+        super().__init__(name, llm_client)
+        self.nodes_list = []  # List of visited viewpoint IDs
+        self.node_imgs = []   # List of images corresponding to nodes
+        self.graph = {}       # Dictionary to store linguistic description of connections
+        self.trajectory = []  # List of visited viewpoint IDs in order
 
-    async def process(self, obs, cand_inputs):
-        await asyncio.gather(*[self.update_map(i, ob, cand_inputs) for i, ob in enumerate(obs)])
-        return self.get_map_data()
+    async def initialize(self) -> None:
+        await super().initialize()
+        await self.log("Initializing MapAgent")
 
-    async def update_map(self, i, ob, cand_inputs):
-        # Update nodes list
-        if ob['viewpoint'] not in self.nodes_list[i]:
-            self.nodes_list[i].append(ob['viewpoint'])
-            self.node_imgs[i].append(None)
+    async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Process the input data to update the map.
 
-        # Update trajectory
-        self.trajectory[i].append(ob['viewpoint'])
+        :param input_data: A dictionary containing:
+            - obs: The current observation data
+            - cand_inputs: Candidate inputs data
+        :return: A dictionary containing the updated map information
+        """
+        obs = input_data['obs']
+        cand_inputs = input_data['cand_inputs']
 
-        # Update graph
-        if ob['viewpoint'] not in self.graph[i]:
-            self.graph[i][ob['viewpoint']] = []
+        current_viewpoint = obs['viewpoint']
+        
+        # Update nodes list and trajectory
+        if current_viewpoint not in self.nodes_list:
+            self.nodes_list.append(current_viewpoint)
+            self.node_imgs.append(None)  # Placeholder for image
+        self.trajectory.append(current_viewpoint)
 
-        # Update candidates
-        for j, cc in enumerate(ob['candidate']):
-            if cc['viewpointId'] not in self.nodes_list[i]:
-                self.nodes_list[i].append(cc['viewpointId'])
-                self.node_imgs[i].append(cc['image'])
+        # Update graph with linguistic descriptions
+        self.graph[current_viewpoint] = []
+        for candidate in obs['candidate']:
+            cand_viewpoint = candidate['viewpointId']
+            self.graph[current_viewpoint].append(cand_viewpoint)
+            
+            if cand_viewpoint not in self.nodes_list:
+                self.nodes_list.append(cand_viewpoint)
+                self.node_imgs.append(candidate['image'])
             else:
-                node_index = self.nodes_list[i].index(cc['viewpointId'])
-                self.node_imgs[i][node_index] = cc['image']
+                node_index = self.nodes_list.index(cand_viewpoint)
+                self.node_imgs[node_index] = candidate['image']
 
-            if cc['viewpointId'] not in self.graph[i][ob['viewpoint']]:
-                self.graph[i][ob['viewpoint']].append(cc['viewpointId'])
+        # Generate map description
+        map_description = await self._generate_map_description()
 
-    def get_map_data(self):
         return {
             'nodes_list': self.nodes_list,
             'node_imgs': self.node_imgs,
             'graph': self.graph,
-            'trajectory': self.trajectory
+            'trajectory': self.trajectory,
+            'map_description': map_description
         }
 
-    def make_map_prompt(self, i):
-        trajectory = self.trajectory[i]
-        nodes_list = self.nodes_list[i]
-        graph = self.graph[i]
+    async def _generate_map_description(self) -> str:
+        """
+        Generate a textual description of the current map state using the LLM.
 
-        no_dup_nodes = []
-        trajectory_text = 'Place'
-        graph_text = ''
+        :return: A string describing the current map state
+        """
+        trajectory_text = self._format_trajectory()
+        graph_text = self._format_graph()
 
-        candidate_nodes = graph[trajectory[-1]]
+        prompt = f"""
+        Given the following map information, provide a concise description of the environment:
 
-        # Trajectory and map connectivity
-        for node in trajectory:
-            node_index = nodes_list.index(node)
-            trajectory_text += f" {node_index}"
+        Trajectory: {trajectory_text}
 
-            if node not in no_dup_nodes:
-                no_dup_nodes.append(node)
+        Connections:
+        {graph_text}
 
-                adj_text = ''
-                adjacent_nodes = graph[node]
-                for adj_node in adjacent_nodes:
-                    adj_index = nodes_list.index(adj_node)
-                    adj_text += f" {adj_index},"
+        Describe the overall structure of the environment, highlighting the path taken and potential navigation options.
+        """
 
-                graph_text += f"\nPlace {node_index} is connected with Places{adj_text}"[:-1]
+        return await self.generate_with_llm(prompt)
 
-        # Ghost nodes info
-        graph_supp_text = ''
+    def _format_trajectory(self) -> str:
+        """Format the trajectory for the LLM prompt."""
+        return "Place " + " ".join([str(self.nodes_list.index(node)) for node in self.trajectory])
+
+    def _format_graph(self) -> str:
+        """Format the graph connections for the LLM prompt."""
+        graph_text = ""
+        for node, connections in self.graph.items():
+            node_index = self.nodes_list.index(node)
+            connection_indices = [str(self.nodes_list.index(conn)) for conn in connections]
+            graph_text += f"Place {node_index} is connected with Places {', '.join(connection_indices)}\n"
+        return graph_text
+
+    async def make_map_prompt(self) -> tuple:
+        """
+        Create prompts for trajectory, graph, and supplementary information.
+
+        :return: A tuple containing trajectory_text, graph_text, and graph_supp_text
+        """
+        trajectory_text = self._format_trajectory()
+        graph_text = self._format_graph()
+
+        # Generate supplementary info
+        graph_supp_text = ""
         supp_exist = None
-        for node_index, node in enumerate(nodes_list):
-            if node in trajectory or node in candidate_nodes:
+        for node_index, node in enumerate(self.nodes_list):
+            if node in self.trajectory or node in self.graph.get(self.trajectory[-1], []):
                 continue
             supp_exist = True
             graph_supp_text += f"\nPlace {node_index}, which is corresponding to Image {node_index}"
@@ -173,11 +274,24 @@ class MapAgent(Agent):
 
         return trajectory_text, graph_text, graph_supp_text
 
+    async def shutdown(self) -> None:
+        await self.log("Shutting down MapAgent")
+        await super().shutdown()
 
 
 class MemoryAgent(Agent):
-    def __init__(self, batch_size: int):
+    def __init__(self, name: str, llm_client: LLMClient, batch_size: int, short_term_capacity: int = 10):
+        super().__init__(name, llm_client)
         self.batch_size = batch_size
+        self.short_term_capacity = short_term_capacity
+        
+        # Short-term memory
+        self.short_term_memory: List[List[Dict[str, Any]]] = [[] for _ in range(self.batch_size)]
+        
+        # Long-term memory
+        self.long_term_memory: List[Dict[str, Any]] = [{} for _ in range(self.batch_size)]
+        
+        # Other memory structures
         self.history: List[str] = ['' for _ in range(self.batch_size)]
         self.nodes_list: List[List[str]] = [[] for _ in range(self.batch_size)]
         self.node_imgs: List[List[Any]] = [[] for _ in range(self.batch_size)]
@@ -185,121 +299,125 @@ class MemoryAgent(Agent):
         self.trajectory: List[List[str]] = [[] for _ in range(self.batch_size)]
         self.planning: List[List[str]] = [["Navigation has just started, with no planning yet."] for _ in range(self.batch_size)]
 
-    async def process(self, new_info: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Process new information and update the agent's memory.
-        
-        :param new_info: Dictionary containing new information to be processed
-        :return: Dictionary containing updated memory state
-        """
-        batch_index = new_info.get('batch_index', 0)
-        obs = new_info.get('obs', {})
-        action = new_info.get('action', '')
-        t = new_info.get('t', 0)
+    async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        batch_index = input_data.get('batch_index', 0)
+        action = input_data.get('action', '')
+        new_node = input_data.get('new_node', '')
+        new_node_img = input_data.get('new_node_img', None)
+        connected_nodes = input_data.get('connected_nodes', [])
+        new_plan = input_data.get('new_plan', '')
 
-        # Update nodes list and trajectory
-        if obs['viewpoint'] not in self.nodes_list[batch_index]:
-            self.nodes_list[batch_index].append(obs['viewpoint'])
-            self.node_imgs[batch_index].append(None)
-        self.trajectory[batch_index].append(obs['viewpoint'])
+        # Update short-term memory
+        await self.update_short_term_memory(batch_index, input_data)
 
-        # Update graph
-        if obs['viewpoint'] not in self.graph[batch_index]:
-            self.graph[batch_index][obs['viewpoint']] = [c['viewpointId'] for c in obs['candidate']]
+        # Update other memory structures
+        await self.update_history(batch_index, action)
+        await self.update_graph(batch_index, new_node, connected_nodes)
+        await self.update_trajectory(batch_index, new_node)
+        await self.update_planning(batch_index, new_plan)
+        await self.update_node_images(batch_index, new_node, new_node_img)
 
-        # Update history
-        if t == 0:
-            self.history[batch_index] = f"step {t}: {action}"
+        # Update long-term memory
+        await self.update_long_term_memory(batch_index)
+
+        return self.get_memory_state(batch_index)
+
+    async def update_short_term_memory(self, batch_index: int, input_data: Dict[str, Any]) -> None:
+        self.short_term_memory[batch_index].append(input_data)
+        if len(self.short_term_memory[batch_index]) > self.short_term_capacity:
+            self.short_term_memory[batch_index].pop(0)
+        await self.log(f"Updated short-term memory for batch {batch_index}")
+
+    async def update_long_term_memory(self, batch_index: int) -> None:
+        # Summarize short-term memory and add to long-term memory
+        summary = await self.summarize_short_term_memory(batch_index)
+        timestamp = input_data.get('timestamp', 'unknown')
+        self.long_term_memory[batch_index][timestamp] = summary
+        await self.log(f"Updated long-term memory for batch {batch_index}")
+
+    async def summarize_short_term_memory(self, batch_index: int) -> str:
+        short_term_data = self.short_term_memory[batch_index]
+        prompt = f"Summarize the following sequence of events:\n{short_term_data}\n"
+        prompt += "Provide a concise summary that captures the key information and patterns."
+        summary = await self.generate_with_llm(prompt)
+        return summary
+
+    async def update_history(self, batch_index: int, action: str) -> None:
+        if self.history[batch_index]:
+            self.history[batch_index] += f", {action}"
         else:
-            self.history[batch_index] += f", step {t}: {action}"
+            self.history[batch_index] = action
+        await self.log(f"Updated history for batch {batch_index}: {self.history[batch_index]}")
 
-        # Update planning
-        if 'planning' in new_info:
-            planning = new_info['planning'].replace('new', 'previous').replace('New', 'Previous')
-            self.planning[batch_index].append(planning)
+    async def update_graph(self, batch_index: int, new_node: str, connected_nodes: List[str]) -> None:
+        if new_node not in self.nodes_list[batch_index]:
+            self.nodes_list[batch_index].append(new_node)
 
+        if new_node not in self.graph[batch_index]:
+            self.graph[batch_index][new_node] = []
+
+        for connected_node in connected_nodes:
+            if connected_node not in self.graph[batch_index][new_node]:
+                self.graph[batch_index][new_node].append(connected_node)
+            
+            if connected_node not in self.graph[batch_index]:
+                self.graph[batch_index][connected_node] = []
+            if new_node not in self.graph[batch_index][connected_node]:
+                self.graph[batch_index][connected_node].append(new_node)
+
+        await self.log(f"Updated graph for batch {batch_index}: {self.graph[batch_index]}")
+
+    async def update_trajectory(self, batch_index: int, new_node: str) -> None:
+        self.trajectory[batch_index].append(new_node)
+        await self.log(f"Updated trajectory for batch {batch_index}: {self.trajectory[batch_index]}")
+
+    async def update_planning(self, batch_index: int, new_plan: str) -> None:
+        self.planning[batch_index].append(new_plan)
+        await self.log(f"Updated planning for batch {batch_index}: {new_plan}")
+
+    async def update_node_images(self, batch_index: int, new_node: str, new_node_img: Any) -> None:
+        if new_node not in self.nodes_list[batch_index]:
+            self.nodes_list[batch_index].append(new_node)
+            self.node_imgs[batch_index].append(new_node_img)
+        else:
+            index = self.nodes_list[batch_index].index(new_node)
+            self.node_imgs[batch_index][index] = new_node_img
+        await self.log(f"Updated node image for batch {batch_index}, node {new_node}")
+
+    def get_memory_state(self, batch_index: int) -> Dict[str, Any]:
         return {
+            'short_term_memory': self.short_term_memory[batch_index],
+            'long_term_memory': self.long_term_memory[batch_index],
             'history': self.history[batch_index],
             'nodes_list': self.nodes_list[batch_index],
             'graph': self.graph[batch_index],
             'trajectory': self.trajectory[batch_index],
-            'planning': self.planning[batch_index][-1]
+            'planning': self.planning[batch_index],
         }
 
-    async def get_memory_state(self, batch_index: int) -> Dict[str, Any]:
-        """
-        Retrieve the current memory state for a given batch index.
-        
-        :param batch_index: Index of the batch to retrieve memory for
-        :return: Dictionary containing the current memory state
-        """
-        return {
-            'history': self.history[batch_index],
-            'nodes_list': self.nodes_list[batch_index],
-            'graph': self.graph[batch_index],
-            'trajectory': self.trajectory[batch_index],
-            'planning': self.planning[batch_index][-1]
-        }
-
-    async def clear_memory(self, batch_index: int) -> None:
-        """
-        Clear the memory for a given batch index.
-        
-        :param batch_index: Index of the batch to clear memory for
-        """
-        self.history[batch_index] = ''
-        self.nodes_list[batch_index] = []
-        self.node_imgs[batch_index] = []
-        self.graph[batch_index] = {}
-        self.trajectory[batch_index] = []
-        self.planning[batch_index] = ["Navigation has just started, with no planning yet."]
-
-    async def make_map_prompt(self, batch_index: int) -> Tuple[str, str, str]:
-        """
-        Generate map-related prompts for the given batch index.
-        
-        :param batch_index: Index of the batch to generate prompts for
-        :return: Tuple containing trajectory_text, graph_text, and graph_supp_text
-        """
-        trajectory = self.trajectory[batch_index]
-        nodes_list = self.nodes_list[batch_index]
+    async def generate_graph_description(self, batch_index: int) -> str:
         graph = self.graph[batch_index]
+        prompt = f"Given the following graph structure:\n{graph}\n"
+        prompt += "Generate a concise linguistic description of this graph, focusing on the connections between nodes and any notable patterns or structures."
+        description = await self.generate_with_llm(prompt)
+        return description
 
-        no_dup_nodes = []
-        trajectory_text = 'Place'
-        graph_text = ''
+    async def analyze_trajectory(self, batch_index: int) -> str:
+        trajectory = self.trajectory[batch_index]
+        prompt = f"Given the following navigation trajectory:\n{trajectory}\n"
+        prompt += "Analyze this trajectory and provide insights such as:\n"
+        prompt += "1. Any patterns or repetitions in the path\n"
+        prompt += "2. Potential areas of exploration that have been missed\n"
+        prompt += "3. Suggestions for optimizing the path"
+        analysis = await self.generate_with_llm(prompt)
+        return analysis
 
-        candidate_nodes = graph[trajectory[-1]]
-
-        # Trajectory and map connectivity
-        for node in trajectory:
-            node_index = nodes_list.index(node)
-            trajectory_text += f" {node_index}"
-
-            if node not in no_dup_nodes:
-                no_dup_nodes.append(node)
-
-                adj_text = ''
-                adjacent_nodes = graph[node]
-                for adj_node in adjacent_nodes:
-                    adj_index = nodes_list.index(adj_node)
-                    adj_text += f" {adj_index},"
-
-                graph_text += f"\nPlace {node_index} is connected with Places{adj_text}"[:-1]
-
-        # Ghost nodes info
-        graph_supp_text = ''
-        supp_exist = None
-        for node_index, node in enumerate(nodes_list):
-            if node in trajectory or node in candidate_nodes:
-                continue
-            supp_exist = True
-            graph_supp_text += f"\nPlace {node_index}, which is corresponding to Image {node_index}"
-
-        if supp_exist is None:
-            graph_supp_text = "Nothing yet."
-
-        return trajectory_text, graph_text, graph_supp_text
+    async def query_long_term_memory(self, batch_index: int, query: str) -> str:
+        long_term_data = self.long_term_memory[batch_index]
+        prompt = f"Given the following long-term memory data:\n{long_term_data}\n"
+        prompt += f"Answer the following query: {query}"
+        response = await self.generate_with_llm(prompt)
+        return response
     
 class ActionAgent(Agent):
     def __init__(self, args):
@@ -444,142 +562,212 @@ class ActionAgent(Agent):
         return action_text
     
 class PlanningAgent(Agent):
-    def __init__(self):
-        self.current_plan: List[str] = []
-        self.instruction: str = ""
-        self.trajectory: List[str] = []
-        self.graph: Dict[str, List[str]] = {}
-        self.history: str = ""
+    def __init__(self, name: str, llm_client: LLMClient):
+        super().__init__(name, llm_client)
+        self.current_plan = []
 
-    async def process(self, instruction: str, map_data: Dict[str, Any], current_position: str) -> List[str]:
-        self.instruction = instruction
-        self.trajectory = map_data['trajectory']
-        self.graph = map_data['graph']
-        self.history = map_data['history']
-        
-        return await self.generate_plan(current_position)
+    async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Generate a long-term plan based on the instruction, linguistic graph representation, and current position.
 
-    async def generate_plan(self, current_position: str) -> List[str]:
-        # Analyze the instruction and current state
-        remaining_instructions = self.extract_remaining_instructions()
-        
-        # Generate a high-level plan
-        high_level_plan = self.create_high_level_plan(remaining_instructions)
-        
-        # Translate high-level plan to specific actions
-        detailed_plan = self.translate_to_detailed_plan(high_level_plan, current_position)
-        
-        self.current_plan = detailed_plan
-        return self.current_plan
+        :param input_data: A dictionary containing instruction, graph_description, and current_position
+        :return: A dictionary containing the generated plan and any additional planning information
+        """
+        instruction = input_data.get('instruction', '')
+        graph_description = input_data.get('graph_description', '')
+        current_position = input_data.get('current_position', '')
+        perception_data = input_data.get('perception_data', {})
 
-    def extract_remaining_instructions(self) -> List[str]:
-        executed_steps = self.parse_history()
-        instruction_steps = self.instruction.split('.')
-        
-        remaining_steps = []
-        for step in instruction_steps:
-            if not any(executed_step in step for executed_step in executed_steps):
-                remaining_steps.append(step.strip())
-        
-        return remaining_steps
+        await self.log(f"Generating plan for instruction: {instruction}")
 
-    def parse_history(self) -> List[str]:
-        executed_steps = []
-        step_pattern = re.compile(r'step (\d+): (.+?)(?=, step \d+:|$)')
-        matches = step_pattern.findall(self.history)
-        
-        for _, action in matches:
-            executed_steps.append(action)
-        
-        return executed_steps
+        # Generate a plan using the LLM
+        plan = await self._generate_plan(instruction, graph_description, current_position, perception_data)
 
-    def create_high_level_plan(self, remaining_instructions: List[str]) -> List[str]:
-        high_level_plan = []
-        for instruction in remaining_instructions:
-            if "go to" in instruction.lower():
-                high_level_plan.append(f"Navigate: {instruction}")
-            elif "turn" in instruction.lower():
-                high_level_plan.append(f"Rotate: {instruction}")
-            elif "stop" in instruction.lower() or "you have reached" in instruction.lower():
-                high_level_plan.append("Stop: End navigation")
-            else:
-                high_level_plan.append(f"Explore: {instruction}")
-        return high_level_plan
+        # Update the current plan
+        self.current_plan = plan
 
-    def translate_to_detailed_plan(self, high_level_plan: List[str], current_position: str) -> List[str]:
-        detailed_plan = []
-        for step in high_level_plan:
-            if step.startswith("Navigate:"):
-                target = self.extract_target(step)
-                path = self.find_path(current_position, target)
-                detailed_plan.extend(path)
-                current_position = target
-            elif step.startswith("Rotate:"):
-                direction = "left" if "left" in step.lower() else "right"
-                detailed_plan.append(f"Turn {direction}")
-            elif step.startswith("Stop:"):
-                detailed_plan.append("Stop navigation")
-            elif step.startswith("Explore:"):
-                detailed_plan.append(f"Explore surroundings: {step.split(': ')[1]}")
-        return detailed_plan
+        return {
+            'plan': plan,
+            'plan_summary': await self._summarize_plan(plan),
+            'estimated_steps': len(plan)
+        }
 
-    def extract_target(self, navigation_step: str) -> str:
-        # Simple extraction, can be improved with NLP techniques
-        return navigation_step.split("go to ")[-1].strip()
+    async def _generate_plan(self, instruction: str, graph_description: str, current_position: str, perception_data: Dict[str, Any]) -> List[str]:
+        """
+        Use the LLM to generate a detailed plan based on the given inputs.
 
-    def find_path(self, start: str, goal: str) -> List[str]:
-        # Implement a pathfinding algorithm (e.g., A* or Dijkstra's)
-        # This is a simplified version using BFS
-        queue = [(start, [start])]
-        visited = set()
+        :param instruction: The navigation instruction
+        :param graph_description: The linguistic description of the graph
+        :param current_position: The current position in the environment
+        :param perception_data: The latest perception data from the environment
+        :return: A list of plan steps
+        """
+        prompt = f"""
+        Given the following information, generate a detailed step-by-step plan to navigate to the destination:
 
-        while queue:
-            (node, path) = queue.pop(0)
-            if node not in visited:
-                if node == goal:
-                    return self.path_to_actions(path)
-                visited.add(node)
-                for neighbor in self.graph.get(node, []):
-                    if neighbor not in visited:
-                        queue.append((neighbor, path + [neighbor]))
-        
-        return ["Unable to find path to " + goal]
+        Instruction: {instruction}
 
-    def path_to_actions(self, path: List[str]) -> List[str]:
-        actions = []
-        for i in range(len(path) - 1):
-            current = path[i]
-            next_node = path[i + 1]
-            action = f"Move from Place {self.trajectory.index(current)} to Place {self.trajectory.index(next_node)}"
-            actions.append(action)
-        return actions
+        Current Position: {current_position}
+
+        Environment Description:
+        {graph_description}
+
+        Current Perception:
+        {self._format_perception_data(perception_data)}
+
+        Generate a plan with the following considerations:
+        1. Break down the navigation into clear, actionable steps.
+        2. Include specific directions (e.g., "turn left", "go straight", "take the second right").
+        3. Reference landmarks or notable features mentioned in the environment description or perception data.
+        4. Estimate distances for each step if possible.
+        5. Include any necessary decision points or alternative routes.
+
+        Provide the plan as a numbered list of steps.
+        """
+
+        response = await self.generate_with_llm(prompt)
+        plan_steps = self._parse_plan_steps(response)
+
+        return plan_steps
+
+    def _format_perception_data(self, perception_data: Dict[str, Any]) -> str:
+        """Format perception data for inclusion in the LLM prompt."""
+        current_view = perception_data.get('current_view', {})
+        formatted_data = f"""
+        Scene Description: {current_view.get('scene_description', 'N/A')}
+        Key Objects: {', '.join(current_view.get('key_objects', []))}
+        Landmarks: {', '.join(current_view.get('landmarks', []))}
+        Visible Text: {current_view.get('visible_text', 'N/A')}
+        Estimated Distances: {current_view.get('distances', 'N/A')}
+        Navigation Info: {current_view.get('navigation_info', 'N/A')}
+        """
+        return formatted_data
+
+    def _parse_plan_steps(self, response: str) -> List[str]:
+        """Parse the LLM response into a list of plan steps."""
+        lines = response.strip().split('\n')
+        steps = []
+        for line in lines:
+            if line.strip() and any(line.strip().startswith(str(i)) for i in range(1, 100)):
+                steps.append(line.strip())
+        return steps
+
+    async def _summarize_plan(self, plan: List[str]) -> str:
+        """
+        Generate a brief summary of the plan using the LLM.
+
+        :param plan: The list of plan steps
+        :return: A summary of the plan
+        """
+        plan_text = "\n".join(plan)
+        prompt = f"""
+        Summarize the following navigation plan in 2-3 sentences:
+
+        {plan_text}
+
+        Summary:
+        """
+
+        summary = await self.generate_with_llm(prompt)
+        return summary.strip()
+
+    async def update_plan(self, new_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Update the current plan based on new information.
+
+        :param new_data: New information that might affect the plan
+        :return: The updated plan information
+        """
+        await self.log("Updating plan with new information")
+        return await self.process(new_data)
     
-
 class CoordinatorAgent(Agent):
-    def __init__(self):
-        self.perception_agent = PerceptionAgent()
-        self.map_agent = MapAgent()
-        self.planning_agent = PlanningAgent()
-        self.action_agent = ActionAgent()
-        self.memory_agent = MemoryAgent()
+    def __init__(self, name: str, llm_client: LLMClient, args: Any):
+        super().__init__(name, llm_client)
+        self.args = args
+        self.perception_agent = PerceptionAgent("Perception", llm_client)
+        self.map_agent = MapAgent("Map", llm_client)
+        self.planning_agent = PlanningAgent("Planning", llm_client)
+        self.action_agent = ActionAgent(args)
+        self.memory_agent = MemoryAgent("Memory", llm_client, args.batch_size, args.short_term_capacity)
 
-    async def process(self, obs, cand_inputs, t):
-        # Coordinate the flow of information between agents
+    async def process(self, obs: Dict[str, Any], cand_inputs: Dict[str, Any], t: int) -> int:
+        # Process perception
         perception_result = await self.perception_agent.process(obs)
-        map_update = await self.map_agent.process(self.trajectory, self.graph)
-        memory_update = await self.memory_agent.process(perception_result)
-        plan = await self.planning_agent.process(obs['instruction'], map_update, self.current_position)
-        action = await self.action_agent.process(plan, cand_inputs['action_prompts'])
-        return action
+
+        # Update map
+        map_update = await self.map_agent.process({
+            'obs': obs,
+            'cand_inputs': cand_inputs
+        })
+
+        # Update memory
+        memory_update = await self.memory_agent.process({
+            'batch_index': 0,  # Assuming single batch for simplicity
+            'action': obs.get('action', ''),
+            'new_node': obs['viewpoint'],
+            'new_node_img': obs.get('image'),
+            'connected_nodes': [c['viewpointId'] for c in obs.get('candidate', [])],
+            'new_plan': ''  # Will be updated later
+        })
+
+        # Generate or update plan
+        graph_description = await self.map_agent.generate_map_description()
+        plan = await self.planning_agent.process({
+            'instruction': obs['instruction'],
+            'graph_description': graph_description,
+            'current_position': obs['viewpoint'],
+            'perception_data': perception_result
+        })
+
+        # Update memory with new plan
+        await self.memory_agent.update_planning(0, plan['plan_summary'])
+
+        # Decide on action
+        action_index = await self.action_agent.process(
+            plan['plan'][0],  # Use the first step of the plan
+            cand_inputs['action_prompts'],
+            obs,
+            t
+        )
+
+        # Log the decision process
+        await self.log(f"Step {t}: Perception processed, map updated, plan generated, action decided: {cand_inputs['action_prompts'][action_index]}")
+
+        return action_index
+
+    async def initialize(self) -> None:
+        await super().initialize()
+        await asyncio.gather(
+            self.perception_agent.initialize(),
+            self.map_agent.initialize(),
+            self.planning_agent.initialize(),
+            self.memory_agent.initialize()
+        )
+
+    async def shutdown(self) -> None:
+        await asyncio.gather(
+            self.perception_agent.shutdown(),
+            self.map_agent.shutdown(),
+            self.planning_agent.shutdown(),
+            self.memory_agent.shutdown()
+        )
+        await super().shutdown()
 
 class MultiAgentNavigationSystem:
-    def __init__(self, args):
+    def __init__(self, args: Any):
         self.args = args
-        self.coordinator = CoordinatorAgent()
+        self.llm_client = LLMClient()  # Assuming LLMClient is defined elsewhere
+        self.coordinator = CoordinatorAgent("Coordinator", self.llm_client, args)
 
-    async def navigate(self, obs, cand_inputs, t):
+    async def navigate(self, obs: Dict[str, Any], cand_inputs: Dict[str, Any], t: int) -> int:
         return await self.coordinator.process(obs, cand_inputs, t)
 
+    async def initialize(self) -> None:
+        await self.coordinator.initialize()
+
+    async def shutdown(self) -> None:
+        await self.coordinator.shutdown()
 # Usage
 async def main():
     batch_size = 2
