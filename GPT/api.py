@@ -9,7 +9,8 @@ from tenacity import (
 
 generation_key = "xxxxx"  # GPT key
 client = OpenAI(
-    api_key=generation_key,
+    base_url="http://localhost:11434/v1",
+    api_key="ollama",
 )
 
 
@@ -18,7 +19,7 @@ def completion_with_backoff(**kwargs):
     return client.chat.completions.create(**kwargs)
 
 
-def gpt_infer(system, text, image_list, model="gpt-4-vision-preview", max_tokens=600, response_format=None):
+def gpt_infer(system, text, image_list, model="llava", max_tokens=600, response_format=None):
 
     user_content = []
     for i, image in enumerate(image_list):
