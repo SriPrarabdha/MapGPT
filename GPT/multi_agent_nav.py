@@ -1,17 +1,24 @@
 import re
 from typing import List, Dict, Any
 import asyncio
+from openai import OpenAI
 
 import math
 import random
 from abc import ABC, abstractmethod
+import base64
+
+client = OpenAI(
+    base_url = 'http://localhost:11434/v1',
+    api_key='ollama', # required, but unused
+)
 
 class Agent(ABC):
     """
     Abstract base class for all agents in the multi-agent navigation system.
     """
 
-    def __init__(self, name: str, llm_client: LLMClient):
+    def __init__(self, name: str, llm_client: OpenAI):
         """
         Initialize the agent with a name and LLM client.
 
@@ -19,7 +26,10 @@ class Agent(ABC):
         :param llm_client: An instance of LLMClient for interacting with the LLM
         """
         self.name = name
-        self.llm_client = llm_client
+        self.llm_client = OpenAI(
+        base_url = 'http://localhost:11434/v1',
+        api_key='ollama', # required, but unused
+    )
 
     @abstractmethod
     async def process(self, input_data: Any) -> Dict[str, Any]:
@@ -76,7 +86,7 @@ class Agent(ABC):
         """
         print(f"[{self.name}] {message}")
 
-    async def generate_with_llm(self, prompt: str, **kwargs) -> str:
+    async def generate_with_llm(self, system, user_content, **kwargs) -> str:
         """
         Generate a response using the LLM.
 
@@ -84,7 +94,18 @@ class Agent(ABC):
         :param kwargs: Additional keyword arguments for the LLM client
         :return: The generated response
         """
-        return await self.llm_client.generate(prompt, **kwargs)
+        messages = [
+        {"role": "system",
+         "content": system
+         },
+        {"role": "user",
+         "content": user_content
+         }
+    ]
+        response = self.llm_client.chat.completions.create(model="llava:7b",temperature=0.5, max_tokens=1000, messages=messages, **kwargs)
+        print("-----------------------------open ai working -------------------------------")
+        print(response.choices[0].message.content)
+        return response.choices[0].message.content
 
 
 class PerceptionAgent(Agent):
@@ -132,8 +153,28 @@ class PerceptionAgent(Agent):
         5. Estimated distances to major objects
         6. Potential navigation paths or obstacles
         """
+        with open(image, "rb") as image_file:
+                image_base64 = base64.b64encode(image_file.read()).decode('utf-8')
 
-        response = await self.generate_with_llm(prompt, image=image)
+        user_content=[]
+        system = """You are an embodied robot that navigates in the real world."""
+        image_message = {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{image_base64}",
+                        "detail": "low"
+                    }
+                }
+        
+        user_content.append(image_message)
+        user_content.append(
+        {
+            "type": "text",
+            "text": prompt
+        }
+    )
+        
+        response = await self.generate_with_llm(system=system, user_content=user_content)
         
         # Parse the LLM response to extract structured information
         parsed_info = {
@@ -161,7 +202,7 @@ class PerceptionAgent(Agent):
         return [item.strip() for item in info.split(',') if item.strip()]
 
 class MapAgent(Agent):
-    def __init__(self, name: str, llm_client: LLMClient):
+    def __init__(self, name: str, llm_client: OpenAI):
         super().__init__(name, llm_client)
         self.nodes_list = []  # List of visited viewpoint IDs
         self.node_imgs = []   # List of images corresponding to nodes
@@ -175,29 +216,24 @@ class MapAgent(Agent):
     async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Process the input data to update the map.
-
         :param input_data: A dictionary containing:
-            - obs: The current observation data
-            - cand_inputs: Candidate inputs data
+        - obs: The current observation data
         :return: A dictionary containing the updated map information
         """
         obs = input_data['obs']
-        cand_inputs = input_data['cand_inputs']
-
         current_viewpoint = obs['viewpoint']
-        
+
         # Update nodes list and trajectory
         if current_viewpoint not in self.nodes_list:
             self.nodes_list.append(current_viewpoint)
             self.node_imgs.append(None)  # Placeholder for image
         self.trajectory.append(current_viewpoint)
 
-        # Update graph with linguistic descriptions
+        # Update graph with connections
         self.graph[current_viewpoint] = []
         for candidate in obs['candidate']:
             cand_viewpoint = candidate['viewpointId']
             self.graph[current_viewpoint].append(cand_viewpoint)
-            
             if cand_viewpoint not in self.nodes_list:
                 self.nodes_list.append(cand_viewpoint)
                 self.node_imgs.append(candidate['image'])
@@ -235,8 +271,15 @@ class MapAgent(Agent):
 
         Describe the overall structure of the environment, highlighting the path taken and potential navigation options.
         """
+        system = """You are an embodied robot that navigates in the real world."""
+        user_content = []
+        user_content.append(
+        {
+            "type": "text",
+            "text": prompt
+        })
 
-        return await self.generate_with_llm(prompt)
+        return await self.generate_with_llm(system=system, user_content=user_content)
 
     def _format_trajectory(self) -> str:
         """Format the trajectory for the LLM prompt."""
@@ -278,9 +321,9 @@ class MapAgent(Agent):
         await self.log("Shutting down MapAgent")
         await super().shutdown()
 
-
+## code to debug
 class MemoryAgent(Agent):
-    def __init__(self, name: str, llm_client: LLMClient, batch_size: int, short_term_capacity: int = 10):
+    def __init__(self, name: str, llm_client: OpenAI, batch_size: int, short_term_capacity: int = 10):
         super().__init__(name, llm_client)
         self.batch_size = batch_size
         self.short_term_capacity = short_term_capacity
@@ -289,7 +332,7 @@ class MemoryAgent(Agent):
         self.short_term_memory: List[List[Dict[str, Any]]] = [[] for _ in range(self.batch_size)]
         
         # Long-term memory
-        self.long_term_memory: List[Dict[str, Any]] = [{} for _ in range(self.batch_size)]
+        self.long_term_memory: List[List[str]] = [[] for _ in range(self.batch_size)]
         
         # Other memory structures
         self.history: List[str] = ['' for _ in range(self.batch_size)]
@@ -331,15 +374,21 @@ class MemoryAgent(Agent):
     async def update_long_term_memory(self, batch_index: int) -> None:
         # Summarize short-term memory and add to long-term memory
         summary = await self.summarize_short_term_memory(batch_index)
-        timestamp = input_data.get('timestamp', 'unknown')
-        self.long_term_memory[batch_index][timestamp] = summary
+        self.long_term_memory[batch_index].append(summary)
         await self.log(f"Updated long-term memory for batch {batch_index}")
 
     async def summarize_short_term_memory(self, batch_index: int) -> str:
         short_term_data = self.short_term_memory[batch_index]
         prompt = f"Summarize the following sequence of events:\n{short_term_data}\n"
         prompt += "Provide a concise summary that captures the key information and patterns."
-        summary = await self.generate_with_llm(prompt)
+        user_content = []
+        user_content.append(
+        {
+            "type": "text",
+            "text": prompt
+        })
+        system = """You are an embodied robot that navigates in the real world."""
+        summary = await self.generate_with_llm(system=system, user_content=user_content)
         return summary
 
     async def update_history(self, batch_index: int, action: str) -> None:
@@ -381,6 +430,9 @@ class MemoryAgent(Agent):
             self.node_imgs[batch_index].append(new_node_img)
         else:
             index = self.nodes_list[batch_index].index(new_node)
+            # Ensure node_imgs list is long enough
+            while len(self.node_imgs[batch_index]) <= index:
+                self.node_imgs[batch_index].append(None)
             self.node_imgs[batch_index][index] = new_node_img
         await self.log(f"Updated node image for batch {batch_index}, node {new_node}")
 
@@ -399,7 +451,15 @@ class MemoryAgent(Agent):
         graph = self.graph[batch_index]
         prompt = f"Given the following graph structure:\n{graph}\n"
         prompt += "Generate a concise linguistic description of this graph, focusing on the connections between nodes and any notable patterns or structures."
-        description = await self.generate_with_llm(prompt)
+
+        user_content = []
+        user_content.append(
+        {
+            "type": "text",
+            "text": prompt
+        })
+        system = """You are an embodied robot that navigates in the real world."""
+        description = await self.generate_with_llm(system=system, user_content=user_content)
         return description
 
     async def analyze_trajectory(self, batch_index: int) -> str:
@@ -409,17 +469,38 @@ class MemoryAgent(Agent):
         prompt += "1. Any patterns or repetitions in the path\n"
         prompt += "2. Potential areas of exploration that have been missed\n"
         prompt += "3. Suggestions for optimizing the path"
-        analysis = await self.generate_with_llm(prompt)
+
+        user_content = []
+        user_content.append(
+        {
+            "type": "text",
+            "text": prompt
+        })
+        system = """You are an embodied robot that navigates in the real world."""
+        analysis = await self.generate_with_llm(system=system, user_content=user_content)
+
         return analysis
 
     async def query_long_term_memory(self, batch_index: int, query: str) -> str:
         long_term_data = self.long_term_memory[batch_index]
         prompt = f"Given the following long-term memory data:\n{long_term_data}\n"
         prompt += f"Answer the following query: {query}"
-        response = await self.generate_with_llm(prompt)
-        return response
+
+        user_content = []
+        user_content.append(
+        {
+            "type": "text",
+            "text": prompt
+        })
+        system = """You are an embodied robot that navigates in the real world."""
+        response = await self.generate_with_llm(system=system, user_content=user_content)
     
-class ActionAgent(Agent):
+        return response
+#code to debug  
+from typing import List, Dict, Any
+import math
+
+class ActionAgent:
     def __init__(self, args):
         self.args = args
 
@@ -433,42 +514,44 @@ class ActionAgent(Agent):
         :param t: Current time step
         :return: Index of the chosen action
         """
-        # Parse the plan to extract the next intended action
         next_action = self._parse_plan(plan)
-        
-        # Match the intended action with available options
-        action_index = self._match_action(next_action, action_options)
-        
-        # If no match found, use a fallback strategy
-        if action_index is None:
-            action_index = self._fallback_strategy(obs, action_options, t)
-        
-        return action_index
+        return self._match_action(next_action, action_options, t)
 
     def _parse_plan(self, plan: str) -> str:
         """
         Extract the next intended action from the plan.
         """
-        # Simple parsing strategy: take the first sentence as the next action
         sentences = plan.split('.')
-        if sentences:
-            return sentences[0].strip().lower()
-        return ""
+        return sentences[0].strip().lower() if sentences else ""
 
-    def _match_action(self, intended_action: str, action_options: List[str]) -> int:
+    def _match_action(self, intended_action: str, action_options: List[str], t: int) -> int:
         """
-        Match the intended action with available options.
+        Match the intended action with available options or choose the best alternative.
         """
-        for i, option in enumerate(action_options):
-            if self._action_matches(intended_action, option.lower()):
-                return i
-        return None
+        action_scores = [self._calculate_action_score(intended_action, option, i, t) 
+                         for i, option in enumerate(action_options)]
+        return max(range(len(action_scores)), key=action_scores.__getitem__)
 
-    def _action_matches(self, intended_action: str, option: str) -> bool:
+    def _calculate_action_score(self, intended_action: str, option: str, index: int, t: int) -> float:
         """
-        Check if the intended action matches an option.
+        Calculate a score for how well an action option matches the intended action.
         """
-        # Define key phrases for each action type
+        base_score = self._action_similarity(intended_action, option.lower())
+        
+        # Penalize 'stop' action in the first few steps
+        if "stop" in option.lower() and t < self.args.stop_after:
+            base_score -= 1000  # Large penalty to avoid selecting 'stop'
+        
+        # Slight preference for continuing forward if scores are tied
+        if "forward" in option.lower():
+            base_score += 0.1
+        
+        return base_score
+
+    def _action_similarity(self, intended_action: str, option: str) -> float:
+        """
+        Calculate similarity between intended action and option.
+        """
         action_phrases = {
             "go forward": ["go forward", "move forward", "continue straight"],
             "turn left": ["turn left", "go left"],
@@ -479,90 +562,43 @@ class ActionAgent(Agent):
             "stop": ["stop", "halt", "end navigation"]
         }
 
-        # Check if any key phrase for the option is in the intended action
+        max_similarity = 0
         for action, phrases in action_phrases.items():
             if action in option:
-                return any(phrase in intended_action for phrase in phrases)
+                for phrase in phrases:
+                    similarity = self._phrase_similarity(intended_action, phrase)
+                    max_similarity = max(max_similarity, similarity)
 
-        return False
+        return max_similarity
 
-    def _fallback_strategy(self, obs: Dict[str, Any], action_options: List[str], t: int) -> int:
+    def _phrase_similarity(self, phrase1: str, phrase2: str) -> float:
         """
-        Implement a fallback strategy when the plan doesn't match available actions.
+        Calculate a simple similarity score between two phrases.
         """
-        # Example fallback: choose the action that brings us closest to the goal
-        goal_position = self._extract_goal_position(obs['instruction'])
-        current_position = obs['viewpoint']
-        
-        best_action = 0
-        min_distance = float('inf')
-        
-        for i, option in enumerate(action_options):
-            next_position = self._simulate_action(current_position, option)
-            distance = self._calculate_distance(next_position, goal_position)
-            
-            if distance < min_distance:
-                min_distance = distance
-                best_action = i
-        
-        # Avoid stopping in the first few steps
-        if bool(self.args.stop_after) and t < self.args.stop_after:
-            best_action = max(1, best_action)  # Ensure we don't choose 'stop' (assumed to be at index 0)
-        
-        return best_action
-
-    def _extract_goal_position(self, instruction: str) -> Dict[str, float]:
-        """
-        Extract the goal position from the instruction.
-        This is a placeholder and should be implemented based on your specific instruction format.
-        """
-        # Placeholder implementation
-        return {'x': 0, 'y': 0, 'z': 0}
-
-    def _simulate_action(self, current_position: Dict[str, float], action: str) -> Dict[str, float]:
-        """
-        Simulate the result of taking an action from the current position.
-        This is a placeholder and should be implemented based on your specific environment.
-        """
-        # Placeholder implementation
-        return current_position
-
-    def _calculate_distance(self, pos1: Dict[str, float], pos2: Dict[str, float]) -> float:
-        """
-        Calculate the distance between two positions.
-        """
-        return math.sqrt(sum((pos1[k] - pos2[k])**2 for k in pos1.keys()))
+        words1 = set(phrase1.split())
+        words2 = set(phrase2.split())
+        return len(words1.intersection(words2)) / max(len(words1), len(words2))
 
     def get_action_concept(self, rel_heading, rel_elevation):
         """
         Get the action concept based on relative heading and elevation.
         """
         if rel_elevation > 0:
-            action_text = 'go up'
+            return 'go up'
         elif rel_elevation < 0:
-            action_text = 'go down'
+            return 'go down'
         else:
-            if rel_heading < 0:
-                if rel_heading >= -math.pi / 2:
-                    action_text = 'turn left'
-                elif rel_heading < -math.pi / 2 and rel_heading > -math.pi * 3 / 2:
-                    action_text = 'turn around'
-                else:
-                    action_text = 'turn right'
-            elif rel_heading > 0:
-                if rel_heading <= math.pi / 2:
-                    action_text = 'turn right'
-                elif rel_heading > math.pi / 2 and rel_heading < math.pi * 3 / 2:
-                    action_text = 'turn around'
-                else:
-                    action_text = 'turn left'
-            elif rel_heading == 0:
-                action_text = 'go forward'
-
-        return action_text
-    
+            if rel_heading == 0:
+                return 'go forward'
+            elif -math.pi / 2 <= rel_heading < 0:
+                return 'turn left'
+            elif 0 < rel_heading <= math.pi / 2:
+                return 'turn right'
+            else:
+                return 'turn around'
+                
 class PlanningAgent(Agent):
-    def __init__(self, name: str, llm_client: LLMClient):
+    def __init__(self, name: str, llm_client: OpenAI):
         super().__init__(name, llm_client)
         self.current_plan = []
 
@@ -624,8 +660,14 @@ class PlanningAgent(Agent):
 
         Provide the plan as a numbered list of steps.
         """
-
-        response = await self.generate_with_llm(prompt)
+        user_content = []
+        user_content.append(
+        {
+            "type": "text",
+            "text": prompt
+        })
+        system = """You are an embodied robot that navigates in the real world."""
+        response = await self.generate_with_llm(system=system, user_content=user_content)
         plan_steps = self._parse_plan_steps(response)
 
         return plan_steps
@@ -668,7 +710,15 @@ class PlanningAgent(Agent):
         Summary:
         """
 
-        summary = await self.generate_with_llm(prompt)
+        user_content = []
+        user_content.append(
+        {
+            "type": "text",
+            "text": prompt
+        })
+        system = """You are an embodied robot that navigates in the real world."""
+        summary = await self.generate_with_llm(system=system, user_content=user_content)
+    
         return summary.strip()
 
     async def update_plan(self, new_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -681,127 +731,131 @@ class PlanningAgent(Agent):
         await self.log("Updating plan with new information")
         return await self.process(new_data)
     
-class CoordinatorAgent(Agent):
-    def __init__(self, name: str, llm_client: LLMClient, args: Any):
-        super().__init__(name, llm_client)
-        self.args = args
-        self.perception_agent = PerceptionAgent("Perception", llm_client)
-        self.map_agent = MapAgent("Map", llm_client)
-        self.planning_agent = PlanningAgent("Planning", llm_client)
-        self.action_agent = ActionAgent(args)
-        self.memory_agent = MemoryAgent("Memory", llm_client, args.batch_size, args.short_term_capacity)
+# class CoordinatorAgent(Agent):
+#     def __init__(self, name: str, llm_client: OpenAI, args: Any):
+#         super().__init__(name, llm_client)
+#         self.args = args
+#         self.perception_agent = PerceptionAgent("Perception", llm_client)
+#         self.map_agent = MapAgent("Map", llm_client)
+#         self.planning_agent = PlanningAgent("Planning", llm_client)
+#         self.action_agent = ActionAgent(args)
+#         self.memory_agent = MemoryAgent("Memory", llm_client, args.batch_size, args.short_term_capacity)
 
-    async def process(self, obs: Dict[str, Any], cand_inputs: Dict[str, Any], t: int) -> int:
-        # Process perception
-        perception_result = await self.perception_agent.process(obs)
+#     async def process(self, obs: Dict[str, Any], cand_inputs: Dict[str, Any], t: int) -> int:
+#         # Process perception
+#         perception_result = await self.perception_agent.process(obs)
 
-        # Update map
-        map_update = await self.map_agent.process({
-            'obs': obs,
-            'cand_inputs': cand_inputs
-        })
+#         # Update map
+#         map_update = await self.map_agent.process({
+#             'obs': obs,
+#             'cand_inputs': cand_inputs
+#         })
 
-        # Update memory
-        memory_update = await self.memory_agent.process({
-            'batch_index': 0,  # Assuming single batch for simplicity
-            'action': obs.get('action', ''),
-            'new_node': obs['viewpoint'],
-            'new_node_img': obs.get('image'),
-            'connected_nodes': [c['viewpointId'] for c in obs.get('candidate', [])],
-            'new_plan': ''  # Will be updated later
-        })
+#         # Update memory
+#         memory_update = await self.memory_agent.process({
+#             'batch_index': 0,  # Assuming single batch for simplicity
+#             'action': obs.get('action', ''),
+#             'new_node': obs['viewpoint'],
+#             'new_node_img': obs.get('image'),
+#             'connected_nodes': [c['viewpointId'] for c in obs.get('candidate', [])],
+#             'new_plan': ''  # Will be updated later
+#         })
 
-        # Generate or update plan
-        graph_description = await self.map_agent.generate_map_description()
-        plan = await self.planning_agent.process({
-            'instruction': obs['instruction'],
-            'graph_description': graph_description,
-            'current_position': obs['viewpoint'],
-            'perception_data': perception_result
-        })
+#         # Generate or update plan
+#         graph_description = await self.map_agent._generate_map_description()
+#         plan = await self.planning_agent.process({
+#             'instruction': obs['instruction'],
+#             'graph_description': graph_description,
+#             'current_position': obs['viewpoint'],
+#             'perception_data': perception_result
+#         })
 
-        # Update memory with new plan
-        await self.memory_agent.update_planning(0, plan['plan_summary'])
+#         # Update memory with new plan
+#         await self.memory_agent.update_planning(0, plan['plan_summary'])
 
-        # Decide on action
-        action_index = await self.action_agent.process(
-            plan['plan'][0],  # Use the first step of the plan
-            cand_inputs['action_prompts'],
-            obs,
-            t
-        )
+#         # Decide on action
+#         action_index = await self.action_agent.process(
+#             plan['plan'][0],  # Use the first step of the plan
+#             cand_inputs['action_prompts'],
+#             obs,
+#             t
+#         )
 
-        # Log the decision process
-        await self.log(f"Step {t}: Perception processed, map updated, plan generated, action decided: {cand_inputs['action_prompts'][action_index]}")
+#         # Log the decision process
+#         await self.log(f"Step {t}: Perception processed, map updated, plan generated, action decided: {cand_inputs['action_prompts'][action_index]}")
 
-        return action_index
+#         return action_index
 
-    async def initialize(self) -> None:
-        await super().initialize()
-        await asyncio.gather(
-            self.perception_agent.initialize(),
-            self.map_agent.initialize(),
-            self.planning_agent.initialize(),
-            self.memory_agent.initialize()
-        )
+#     async def initialize(self) -> None:
+#         await super().initialize()
+#         await asyncio.gather(
+#             self.perception_agent.initialize(),
+#             self.map_agent.initialize(),
+#             self.planning_agent.initialize(),
+#             self.memory_agent.initialize()
+#         )
 
-    async def shutdown(self) -> None:
-        await asyncio.gather(
-            self.perception_agent.shutdown(),
-            self.map_agent.shutdown(),
-            self.planning_agent.shutdown(),
-            self.memory_agent.shutdown()
-        )
-        await super().shutdown()
+#     async def shutdown(self) -> None:
+#         await asyncio.gather(
+#             self.perception_agent.shutdown(),
+#             self.map_agent.shutdown(),
+#             self.planning_agent.shutdown(),
+#             self.memory_agent.shutdown()
+#         )
+#         await super().shutdown()
 
-class MultiAgentNavigationSystem:
-    def __init__(self, args: Any):
-        self.args = args
-        self.llm_client = LLMClient()  # Assuming LLMClient is defined elsewhere
-        self.coordinator = CoordinatorAgent("Coordinator", self.llm_client, args)
+# class MultiAgentNavigationSystem:
+#     def __init__(self, args: Any):
+#         self.args = args
+#         self.llm_client = OpenAI(
+#             base_url = 'http://localhost:11434/v1',
+#             api_key='ollama',
+#         )  
+#         self.coordinator = CoordinatorAgent("Coordinator", self.llm_client, args)
 
-    async def navigate(self, obs: Dict[str, Any], cand_inputs: Dict[str, Any], t: int) -> int:
-        return await self.coordinator.process(obs, cand_inputs, t)
+#     async def navigate(self, obs: Dict[str, Any], cand_inputs: Dict[str, Any], t: int) -> int:
+#         return await self.coordinator.process(obs, cand_inputs, t)
 
-    async def initialize(self) -> None:
-        await self.coordinator.initialize()
+#     async def initialize(self) -> None:
+#         await self.coordinator.initialize()
 
-    async def shutdown(self) -> None:
-        await self.coordinator.shutdown()
-# Usage
-async def main():
-    batch_size = 2
-    map_agent = MapAgent(batch_size)
+#     async def shutdown(self) -> None:
+#         await self.coordinator.shutdown()
+# # Usage
+# async def main():
+#     batch_size = 2
+#     map_agent = MapAgent(batch_size)
     
-    # Sample data (you would replace this with actual data from your navigation system)
-    obs = [
-        {
-            'viewpoint': 'A',
-            'candidate': [
-                {'viewpointId': 'B', 'image': 'image_B'},
-                {'viewpointId': 'C', 'image': 'image_C'}
-            ]
-        },
-        {
-            'viewpoint': 'X',
-            'candidate': [
-                {'viewpointId': 'Y', 'image': 'image_Y'},
-                {'viewpointId': 'Z', 'image': 'image_Z'}
-            ]
-        }
-    ]
-    cand_inputs = {}  # Add relevant candidate inputs if needed
+#     # [{'instr_id': '6250_2', 'scan': 'VLzqgDo317F', 'viewpoint': 'af3af33b0120469c9a00daa0d0b36799', 'viewIndex': 19, 'position': (2.2407100200653076, -5.2129998207092285, 4.926660060882568), 'heading': 3.665191429188092, 'elevation': 0.0, 'candidate': [{'heading': -1.0016941434798468, 'elevation': -0.06440292794585596, 'normalized_heading': 2.663497285708245, 'normalized_elevation': -0.06440292794585596, 'scanId': 'VLzqgDo317F', 'viewpointId': 'c55fa077761c4154af4b26da88eee80d', 'pointId': 17, 'distance': 0.07885618074593771, 'idx': 1, 'position': (3.605950117111206, -7.847620010375977, 4.735290050506592), 'caption': None, 'image': '/media/mlr_lab/6E18DC183015F19C/Ashu/Ashutosh_Dataset/VLN/Docker_Base/MapGPT/RGB_Observations/VLzqgDo317F/af3af33b0120469c9a00daa0d0b36799/17.jpg', 'absolute_heading': 2.617993877991494, 'absolute_elevation': 0.0, 'pretrained_inference': None}, {'heading': -0.572767977002155, 'elevation': -0.07284135849417891, 'normalized_heading': 3.092423452185937, 'normalized_elevation': -0.07284135849417891, 'scanId': 'VLzqgDo317F', 'viewpointId': '5be145994f974347850a48cecd04cdcd', 'pointId': 18, 'distance': 0.08788329689975492, 'idx': 1, 'position': (2.366260051727295, -7.764369964599609, 4.740260124206543), 'caption': None, 'image': '/media/mlr_lab/6E18DC183015F19C/Ashu/Ashutosh_Dataset/VLN/Docker_Base/MapGPT/RGB_Observations/VLzqgDo317F/af3af33b0120469c9a00daa0d0b36799/18.jpg', 'absolute_heading': 3.141592653589793, 'absolute_elevation': 0.0, 'pretrained_inference': None}], 'navigableLocations': [<MatterSim.ViewPoint object at 0x7f7056616230>, <MatterSim.ViewPoint object at 0x7f7056616430>], 'instruction': 'walk forward then turn right at the stairs then go down the stairs.', 'instr_encoding': None, 'gt_path': ['af3af33b0120469c9a00daa0d0b36799', '5be145994f974347850a48cecd04cdcd', '79aedad1206b4eea9c4b639ea2182eb7', '1c91ed40af2246f2b126dd0f661970df', '385019f5d018430fa233d483b253076c', 'fd263d778b534f798d0e1ae48886e5f3'], 'path_id': 6250, 'surrounding_tags': None, 'distance': 11.65849160592811}]
 
-    map_data = await map_agent.process(obs, cand_inputs)
-    print("Updated Map Data:", map_data)
+#     obs = [
+#         {
+#             'viewpoint': 'A',
+#             'candidate': [
+#                 {'viewpointId': 'B', 'image': 'image_B'},
+#                 {'viewpointId': 'C', 'image': 'image_C'}
+#             ]
+#         },
+#         {
+#             'viewpoint': 'X',
+#             'candidate': [
+#                 {'viewpointId': 'Y', 'image': 'image_Y'},
+#                 {'viewpointId': 'Z', 'image': 'image_Z'}
+#             ]
+#         }
+#     ]
+#     cand_inputs = {}  # Add relevant candidate inputs if needed
 
-    # Generate map prompts for each batch
-    for i in range(batch_size):
-        trajectory_text, graph_text, graph_supp_text = map_agent.make_map_prompt(i)
-        print(f"\nBatch {i}:")
-        print("Trajectory:", trajectory_text)
-        print("Graph:", graph_text)
-        print("Supplementary Info:", graph_supp_text)
+#     map_data = await map_agent.process(obs, cand_inputs)
+#     print("Updated Map Data:", map_data)
+
+#     # Generate map prompts for each batch
+#     for i in range(batch_size):
+#         trajectory_text, graph_text, graph_supp_text = map_agent.make_map_prompt(i)
+#         print(f"\nBatch {i}:")
+#         print("Trajectory:", trajectory_text)
+#         print("Graph:", graph_text)
+#         print("Supplementary Info:", graph_supp_text)
 
 # Implement MCTS 
 
@@ -897,5 +951,6 @@ class MCTSNavigator:
 
     def choose_action(self, current_state):
         return self.mcts.choose_action(current_state, self.num_simulations)
-if __name__ == "__main__":
-    asyncio.run(main())
+
+# if __name__ == "__main__":
+#     asyncio.run(main())

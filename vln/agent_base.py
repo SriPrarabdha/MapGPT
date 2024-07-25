@@ -22,13 +22,16 @@ class BaseAgent(object):
     def rollout(self, **args):
         raise NotImplementedError
 
+    # async def test(self, iters=None, args=None, **kwargs):
     def test(self, iters=None, args=None, **kwargs):
         self.env.reset_epoch(shuffle=(iters is not None))   # If iters is not none, shuffle the env batch
         self.results = {}
         looped = False
 
         while True:
-            for traj in self.rollout(**kwargs):
+            # result = await self.rollout(**kwargs)
+            result = self.rollout(**kwargs)
+            for  traj in result:
                 if traj is None:
                     looped = True
                 else:

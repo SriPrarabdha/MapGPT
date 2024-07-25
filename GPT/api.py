@@ -7,10 +7,9 @@ from tenacity import (
 )  # for exponential backoff
 
 
-generation_key = "xxxxx"  # GPT key
+generation_key = "xx"  # GPT key
 client = OpenAI(
-    base_url="http://localhost:11434/v1",
-    api_key="ollama",
+    api_key=generation_key,
 )
 
 
@@ -19,7 +18,7 @@ def completion_with_backoff(**kwargs):
     return client.chat.completions.create(**kwargs)
 
 
-def gpt_infer(system, text, image_list, model="llava", max_tokens=600, response_format=None):
+def gpt_infer(system, text, image_list, model="gpt-4-vision-preview", max_tokens=600, response_format=None):
 
     user_content = []
     for i, image in enumerate(image_list):
@@ -69,5 +68,4 @@ def gpt_infer(system, text, image_list, model="llava", max_tokens=600, response_
     tokens = chat_message.usage
 
     return answer, tokens
-
 
