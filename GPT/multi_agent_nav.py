@@ -497,105 +497,238 @@ class MemoryAgent(Agent):
     
         return response
 #code to debug  
-from typing import List, Dict, Any
+import re
 import math
+from typing import List, Dict, Any
 
 class ActionAgent:
-    def __init__(self, args):
-        self.args = args
+    def __init__(self, name: str, llm_client: Any):
+        self.name = name
+        self.llm_client = llm_client
 
-    async def process(self, plan: str, action_options: List[str], obs: Dict[str, Any], t: int) -> int:
+    async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Decide on the next action based on the current plan and available options.
+        Process the current state and return the chosen action.
         
-        :param plan: The current navigation plan
-        :param action_options: List of available actions
+        :param input_data: A dictionary containing plan, action_options, obs, and t
+        :return: A dictionary containing the chosen action and additional information
+        """
+        plan = input_data.get('plan', [])
+        action_options = input_data.get('action_options', [])
+        obs = input_data.get('obs', {})
+        t = input_data.get('t', 0)
+
+        current_plan_step = plan[0] if plan else ""
+        
+        action_index = await self._choose_action(current_plan_step, action_options, obs, t)
+        chosen_action = action_options[action_index] if action_index < len(action_options) else "stop"
+
+        return {
+            'chosen_action': chosen_action,
+            'action_index': action_index,
+            'reasoning': await self._generate_reasoning(current_plan_step, chosen_action, obs)
+        }
+
+    async def _choose_action(self, plan_step: str, action_options: List[str], obs: Dict[str, Any], t: int) -> int:
+        """
+        Choose the most appropriate action based on the current plan step and observation.
+        
+        :param plan_step: The current plan step
+        :param action_options: List of available action options
         :param obs: Current observation
         :param t: Current time step
         :return: Index of the chosen action
         """
-        next_action = self._parse_plan(plan)
-        return self._match_action(next_action, action_options, t)
+        prompt = f"""
+        Given the current plan step and available actions, choose the most appropriate action:
 
-    def _parse_plan(self, plan: str) -> str:
-        """
-        Extract the next intended action from the plan.
-        """
-        sentences = plan.split('.')
-        return sentences[0].strip().lower() if sentences else ""
+        Current Plan Step: {plan_step}
 
-    def _match_action(self, intended_action: str, action_options: List[str], t: int) -> int:
-        """
-        Match the intended action with available options or choose the best alternative.
-        """
-        action_scores = [self._calculate_action_score(intended_action, option, i, t) 
-                         for i, option in enumerate(action_options)]
-        return max(range(len(action_scores)), key=action_scores.__getitem__)
+        Available Actions:
+        {self._format_action_options(action_options)}
 
-    def _calculate_action_score(self, intended_action: str, option: str, index: int, t: int) -> float:
+        Current Observation:
+        {self._format_observation(obs)}
+
+        Select the letter (A, B, C, etc.) corresponding to the most appropriate action.
         """
-        Calculate a score for how well an action option matches the intended action.
-        """
-        base_score = self._action_similarity(intended_action, option.lower())
+
+        user_content = [{"type": "text", "text": prompt}]
+        system = "You are an embodied robot that navigates in the real world. Choose the action that best aligns with the current plan step and observation."
         
-        # Penalize 'stop' action in the first few steps
-        if "stop" in option.lower() and t < self.args.stop_after:
-            base_score -= 1000  # Large penalty to avoid selecting 'stop'
+        response = await self.llm_client.generate(system=system, user_content=user_content)
         
-        # Slight preference for continuing forward if scores are tied
-        if "forward" in option.lower():
-            base_score += 0.1
+        chosen_action = self._parse_action(response, action_options)
+        return chosen_action
+
+    def _format_action_options(self, action_options: List[str]) -> str:
+        return "\n".join([f"{chr(65 + i)}. {action}" for i, action in enumerate(action_options)])
+
+    def _format_observation(self, obs: Dict[str, Any]) -> str:
+        return "\n".join([f"{key}: {value}" for key, value in obs.items()])
+
+    def _parse_action(self, response: str, action_options: List[str]) -> int:
+        match = re.search(r'\b([A-Z])\b', response)
+        if match:
+            action_letter = match.group(1)
+            action_index = ord(action_letter) - 65
+            if 0 <= action_index < len(action_options):
+                return action_index
+        return 0  # Default to the first action if no valid action is found
+
+    async def _generate_reasoning(self, plan_step: str, chosen_action: str, obs: Dict[str, Any]) -> str:
+        """
+        Generate reasoning for the chosen action.
         
-        return base_score
-
-    def _action_similarity(self, intended_action: str, option: str) -> float:
+        :param plan_step: The current plan step
+        :param chosen_action: The chosen action
+        :param obs: Current observation
+        :return: Reasoning for the chosen action
         """
-        Calculate similarity between intended action and option.
-        """
-        action_phrases = {
-            "go forward": ["go forward", "move forward", "continue straight"],
-            "turn left": ["turn left", "go left"],
-            "turn right": ["turn right", "go right"],
-            "turn around": ["turn around", "go back"],
-            "go up": ["go up", "move up", "ascend"],
-            "go down": ["go down", "move down", "descend"],
-            "stop": ["stop", "halt", "end navigation"]
-        }
+        prompt = f"""
+        Explain the reasoning behind choosing the following action:
 
-        max_similarity = 0
-        for action, phrases in action_phrases.items():
-            if action in option:
-                for phrase in phrases:
-                    similarity = self._phrase_similarity(intended_action, phrase)
-                    max_similarity = max(max_similarity, similarity)
+        Current Plan Step: {plan_step}
+        Chosen Action: {chosen_action}
 
-        return max_similarity
+        Current Observation:
+        {self._format_observation(obs)}
 
-    def _phrase_similarity(self, phrase1: str, phrase2: str) -> float:
+        Provide a brief explanation (2-3 sentences) for why this action was chosen.
         """
-        Calculate a simple similarity score between two phrases.
-        """
-        words1 = set(phrase1.split())
-        words2 = set(phrase2.split())
-        return len(words1.intersection(words2)) / max(len(words1), len(words2))
+
+        user_content = [{"type": "text", "text": prompt}]
+        system = "You are an embodied robot that navigates in the real world. Explain your action choices clearly and concisely."
+        
+        reasoning = await self.llm_client.generate(system=system, user_content=user_content)
+        return reasoning.strip()
 
     def get_action_concept(self, rel_heading, rel_elevation):
         """
-        Get the action concept based on relative heading and elevation.
+        Convert relative heading and elevation to an action concept.
+        :param rel_heading: Relative heading
+        :param rel_elevation: Relative elevation
+        :return: Action concept as a string
         """
         if rel_elevation > 0:
-            return 'go up'
+            action_text = 'go up'
         elif rel_elevation < 0:
-            return 'go down'
+            action_text = 'go down'
         else:
-            if rel_heading == 0:
-                return 'go forward'
-            elif -math.pi / 2 <= rel_heading < 0:
-                return 'turn left'
-            elif 0 < rel_heading <= math.pi / 2:
-                return 'turn right'
-            else:
-                return 'turn around'
+            if rel_heading < 0:
+                if rel_heading >= -math.pi / 2:
+                    action_text = 'turn left'
+                elif rel_heading < -math.pi / 2 and rel_heading > -math.pi * 3 / 2:
+                    action_text = 'turn around'
+                else:
+                    action_text = 'turn right'
+            elif rel_heading > 0:
+                if rel_heading <= math.pi / 2:
+                    action_text = 'turn right'
+                elif rel_heading > math.pi / 2 and rel_heading < math.pi * 3 / 2:
+                    action_text = 'turn around'
+                else:
+                    action_text = 'turn left'
+            elif rel_heading == 0:
+                action_text = 'go forward'
+        return action_text
+
+# class ActionAgent:
+#     def __init__(self, args):
+#         self.args = args
+
+#     async def process(self, plan: str, action_options: List[str], obs: Dict[str, Any], t: int) -> int:
+#         """
+#         Decide on the next action based on the current plan and available options.
+        
+#         :param plan: The current navigation plan
+#         :param action_options: List of available actions
+#         :param obs: Current observation
+#         :param t: Current time step
+#         :return: Index of the chosen action
+#         """
+#         next_action = self._parse_plan(plan)
+#         return self._match_action(next_action, action_options, t)
+
+#     def _parse_plan(self, plan: str) -> str:
+#         """
+#         Extract the next intended action from the plan.
+#         """
+#         sentences = plan.split('.')
+#         return sentences[0].strip().lower() if sentences else ""
+
+#     def _match_action(self, intended_action: str, action_options: List[str], t: int) -> int:
+#         """
+#         Match the intended action with available options or choose the best alternative.
+#         """
+#         action_scores = [self._calculate_action_score(intended_action, option, i, t) 
+#                          for i, option in enumerate(action_options)]
+#         return max(range(len(action_scores)), key=action_scores.__getitem__)
+
+#     def _calculate_action_score(self, intended_action: str, option: str, index: int, t: int) -> float:
+#         """
+#         Calculate a score for how well an action option matches the intended action.
+#         """
+#         base_score = self._action_similarity(intended_action, option.lower())
+        
+#         # Penalize 'stop' action in the first few steps
+#         if "stop" in option.lower() and t < self.args.stop_after:
+#             base_score -= 1000  # Large penalty to avoid selecting 'stop'
+        
+#         # Slight preference for continuing forward if scores are tied
+#         if "forward" in option.lower():
+#             base_score += 0.1
+        
+#         return base_score
+
+#     def _action_similarity(self, intended_action: str, option: str) -> float:
+#         """
+#         Calculate similarity between intended action and option.
+#         """
+#         action_phrases = {
+#             "go forward": ["go forward", "move forward", "continue straight"],
+#             "turn left": ["turn left", "go left"],
+#             "turn right": ["turn right", "go right"],
+#             "turn around": ["turn around", "go back"],
+#             "go up": ["go up", "move up", "ascend"],
+#             "go down": ["go down", "move down", "descend"],
+#             "stop": ["stop", "halt", "end navigation"]
+#         }
+
+#         max_similarity = 0
+#         for action, phrases in action_phrases.items():
+#             if action in option:
+#                 for phrase in phrases:
+#                     similarity = self._phrase_similarity(intended_action, phrase)
+#                     max_similarity = max(max_similarity, similarity)
+
+#         return max_similarity
+
+#     def _phrase_similarity(self, phrase1: str, phrase2: str) -> float:
+#         """
+#         Calculate a simple similarity score between two phrases.
+#         """
+#         words1 = set(phrase1.split())
+#         words2 = set(phrase2.split())
+#         return len(words1.intersection(words2)) / max(len(words1), len(words2))
+
+#     def get_action_concept(self, rel_heading, rel_elevation):
+#         """
+#         Get the action concept based on relative heading and elevation.
+#         """
+#         if rel_elevation > 0:
+#             return 'go up'
+#         elif rel_elevation < 0:
+#             return 'go down'
+#         else:
+#             if rel_heading == 0:
+#                 return 'go forward'
+#             elif -math.pi / 2 <= rel_heading < 0:
+#                 return 'turn left'
+#             elif 0 < rel_heading <= math.pi / 2:
+#                 return 'turn right'
+#             else:
+#                 return 'turn around'
                 
 class PlanningAgent(Agent):
     def __init__(self, name: str, llm_client: OpenAI):
